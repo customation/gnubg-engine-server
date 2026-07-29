@@ -1,0 +1,156 @@
+name: Publish engine release
+
+# Builds GNU Backgammon as a downloadable engine release and publishes it where
+# GammonBase Desktop looks for it: gammonbase.com/engines/catalogue.json, which
+# the site COMPOSES from the objects this workflow uploads. Nothing rewrites a
+# shared catalogue file, so two engines releasing at the same moment cannot race.
+#
+# What lands in the assets bucket, per platform:
+#   engines/gnubg/identity.json                                  who this engine is
+#   engines/gnubg/<version>/<platform>/release.json              how to install and run it
+#   engines/gnubg/<version>/<platform>/gnubg-<platform>.zip      the engine itself
+#
+# REQUIREMENTS before this can run green:
+#   * customation/backgammon-engine-protocol must exist — Cargo.toml depends on
+#     it by git URL, and cargo cannot fetch a repository that is not there.
+#   * customation/gnubgapi is PRIVATE, so checking it out needs a token with
+#     read access to it: GNUBGAPI_CHECKOUT_TOKEN.
+#   * SCW_OBJECT_STORAGE_ACCESS_KEY / SCW_OBJECT_STORAGE_SECRET_KEY, the same
+#     Scaleway pair the gammonbase site's release workflow uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (semantic, e.g. 0.1.0)'
+        required: true
+  push:
+    tags:
+      - 'v*'
+
+env:
+  # The id the catalogue and every installed copy know this engine by.
+  ENGINE_ID: gnubg
+  S3_ENDPOINT: https://s3.fr-par.scw.cloud
+  S3_BUCKET: gammonbase-assets-prod
+  ENGINES_PREFIX: engines
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            exe: gnubg-engine-server.exe
+            runtime: win-x64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            exe: gnubg-engine-server
+            runtime: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # gnubgapi ships the prebuilt native library and gnubg's data files, so
+      # there is no C build here — only a checkout.
+      - name: Check out gnubgapi
+        uses: actions/checkout@v4
+        with:
+          repository: customation/gnubgapi
+          token: ${{ secrets.GNUBGAPI_CHECKOUT_TOKEN }}
+          path: gnubgapi
+
+      - name: Resolve the version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          # The desktop app orders releases by SEMANTIC version. Note this is the
+          # version of THIS daemon, not of gnubg itself — gnubg's own "1.08.003"
+          # is not a semantic version and never goes in this field.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$VERSION' is not a semantic version"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Publishing $ENGINE_ID $VERSION for ${{ matrix.platform }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the daemon
+        run: cargo build --release
+
+      # The layout the daemon resolves by default, relative to its own
+      # executable — the native library beside it, gnubg's data under data/.
+      # Every runtime library in the platform's runtimes folder comes along:
+      # on Windows libgnubgapi.dll needs its glib and gmp siblings.
+      - name: Assemble the release
+        run: |
+          STAGE="stage/$ENGINE_ID"
+          mkdir -p "$STAGE/data"
+          cp "target/release/${{ matrix.exe }}" "$STAGE/"
+          cp gnubgapi/runtimes/${{ matrix.runtime }}/native/* "$STAGE/"
+          cp -r gnubgapi/data/. "$STAGE/data/"
+          echo "Staged:"; find "$STAGE" -type f | wc -l; du -sh "$STAGE"
+
+      - name: Package and digest
+        run: |
+          ARCHIVE="$ENGINE_ID-${{ matrix.platform }}.zip"
+          (cd "stage/$ENGINE_ID" && 7z a -tzip -mx=5 "../../$ARCHIVE" . > /dev/null)
+          SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+          SIZE=$(wc -c < "$ARCHIVE" | tr -d ' ')
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA" >> "$GITHUB_ENV"
+          echo "SIZE=$SIZE" >> "$GITHUB_ENV"
+          echo "$ARCHIVE  $SHA  $SIZE bytes"
+
+      - name: Write the manifests
+        run: |
+          cat > identity.json <<JSON
+          {
+            "id": "$ENGINE_ID",
+            "name": "GNU Backgammon",
+            "description": "The long-standing free backgammon engine, as an analysis daemon.",
+            "licence": "GPL-3.0-or-later",
+            "sourceUrl": "https://www.gnu.org/software/gnubg/"
+          }
+          JSON
+          cat > release.json <<JSON
+          {
+            "version": "$VERSION",
+            "platform": "${{ matrix.platform }}",
+            "file": "$ARCHIVE",
+            "sha256": "$SHA256",
+            "sizeBytes": $SIZE,
+            "command": "${{ matrix.exe }}",
+            "args": [],
+            "instances": 2
+          }
+          JSON
+          cat identity.json release.json
+
+      # The archive first, then the manifest that publishes it.
+      - name: Publish to object storage
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
+          AWS_DEFAULT_REGION: fr-par
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::error::SCW_OBJECT_STORAGE_ACCESS_KEY / _SECRET_KEY are not set on this repository."
+            exit 1
+          fi
+          BASE="s3://$S3_BUCKET/$ENGINES_PREFIX/$ENGINE_ID"
+          RELEASE="$BASE/$VERSION/${{ matrix.platform }}"
+          aws s3 cp "$ARCHIVE" "$RELEASE/$ARCHIVE" --endpoint-url "$S3_ENDPOINT" --content-type application/zip
+          aws s3 cp release.json "$RELEASE/release.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
+          aws s3 cp identity.json "$BASE/identity.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
+          echo "Published $ENGINE_ID $VERSION (${{ matrix.platform }})"
