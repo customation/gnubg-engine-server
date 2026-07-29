@@ -13,8 +13,8 @@ name: Publish engine release
 # REQUIREMENTS before this can run green:
 #   * customation/backgammon-engine-protocol must exist — Cargo.toml depends on
 #     it by git URL, and cargo cannot fetch a repository that is not there.
-#   * customation/gnubgapi is PRIVATE, so checking it out needs a token with
-#     read access to it: GNUBGAPI_CHECKOUT_TOKEN.
+#   * customation/gnubgapi is public (it is GPL-3.0 and we distribute binaries
+#     built from it), so its checkout needs no token.
 #   * SCW_OBJECT_STORAGE_ACCESS_KEY / SCW_OBJECT_STORAGE_SECRET_KEY, the same
 #     Scaleway pair the gammonbase site's release workflow uses.
 
@@ -58,12 +58,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # gnubgapi ships the prebuilt native library and gnubg's data files, so
-      # there is no C build here — only a checkout.
+      # there is no C build here — only a checkout. Public repository (GPL-3.0,
+      # and we distribute binaries built from it), so no token.
       - name: Check out gnubgapi
         uses: actions/checkout@v4
         with:
           repository: customation/gnubgapi
-          token: ${{ secrets.GNUBGAPI_CHECKOUT_TOKEN }}
           path: gnubgapi
 
       - name: Resolve the version
