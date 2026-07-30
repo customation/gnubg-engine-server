@@ -49,6 +49,16 @@ jobs:
             platform: linux-x86_64
             exe: gnubg-engine-server
             runtime: linux-x64
+          # `platform` and `runtime` disagree on purpose. `platform` is OUR
+          # distribution vocabulary — the exact token the desktop client's
+          # current_platform() returns and filters the catalogue by. `runtime` is
+          # a .NET RID, which is how gnubgapi names its runtimes/ folders. .NET
+          # says arm64 where we say aarch64; neither is wrong and neither should
+          # be "corrected" to match the other.
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            exe: gnubg-engine-server
+            runtime: linux-arm64
     runs-on: ${{ matrix.os }}
     defaults:
       run:
