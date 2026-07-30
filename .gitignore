@@ -1,4 +1,2 @@
 /target-linux/
 /target/
-.cargo/config.toml
-Cargo.lock
