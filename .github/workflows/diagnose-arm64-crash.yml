@@ -72,6 +72,34 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The committed runtimes/ libraries carry no debug info, so the first core
+      # named functions but no lines -- and "a memcpy somewhere in EvalContact"
+      # is not an answer. Build the native library from source with -g instead.
+      # Same flags otherwise: -g changes no codegen, so this is the same crash,
+      # only legible.
+      #
+      # The sed patches the RUNNER'S checkout of gnubgapi and is verified to have
+      # matched. A sed that matched nothing would produce a build with no symbols
+      # and a backtrace that looked exactly like the one we already have.
+      - name: Install gnubg build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libglib2.0-dev libgmp-dev libtool automake autoconf bison flex pkg-config gettext
+
+      - name: Build the native library with symbols
+        run: |
+          cd gnubgapi
+          git submodule init
+          git submodule update --recursive
+          sed -i.bak 's/^    -O2$/    -O2 -g -fno-omit-frame-pointer/' native/build.sh
+          grep -qF -- '-O2 -g -fno-omit-frame-pointer' native/build.sh || {
+            echo "::error::could not add -g to native/build.sh -- its flag list has changed shape"
+            exit 1
+          }
+          cd native
+          GNUBGAPI_TARGET=${{ matrix.runtime }} ./build.sh "$(pwd)/_out"
+          ls -la _out/
+
       - name: Build and stage exactly as the release does
         run: |
           cargo build --release
@@ -80,6 +108,9 @@ jobs:
           cp target/release/gnubg-engine-server "$STAGE/"
           cp gnubgapi/runtimes/${{ matrix.runtime }}/native/* "$STAGE/"
           cp -r gnubgapi/data/. "$STAGE/data/"
+          # The freshly built library REPLACES the committed one, so the core
+          # comes from code whose lines gdb can name.
+          cp gnubgapi/native/_out/libgnubgapi.so "$STAGE/libgnubgapi.so"
 
       - name: Machine facts
         run: |
