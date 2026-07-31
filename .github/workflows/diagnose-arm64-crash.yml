@@ -1,0 +1,157 @@
+name: Diagnose the arm64 evaluateMoves crash
+
+# Where linux-aarch64 dies.
+#
+# The release gate caught it on 2026-07-31, the first time that platform was
+# ever asked to evaluate anything:
+#
+#   PASS describe
+#   PASS evaluatePosition 0ply
+#   FAIL evaluateMoves 0ply 3-1: no response to evaluateMoves (id 3)
+#   ... everything after: [Errno 32] Broken pipe
+#
+# That reads like a hang, and the first version of this file said so: ten
+# minutes elapsed before the harness gave up. It was wrong. Sampling the process
+# at 45s found it ALREADY GONE, so the daemon dies and the ten minutes was only
+# the harness waiting for a reply that was never coming. The broken pipes are
+# the corpse, not the symptom.
+#
+# What is established:
+#   * evaluatePosition passes, so the network, the weights and gnubg's data
+#     files are all fine on ARM.
+#   * The first thing evaluateMoves reaches that evaluatePosition does not is
+#     move scoring, and src/engine.rs records what that involves: "gnubg's move
+#     scoring (FindnSaveBestMoves) drives thread-local task machinery that must
+#     run on the initializing thread". MT_AddTask, MT_WaitForTasks,
+#     MT_GetDoneTasks and MT_AbortTasks are all exported from the built library,
+#     so that machinery is compiled in.
+#   * Nothing reaches stderr, and run_e2e.py passes the daemon's stderr straight
+#     through -- so this is not a Rust panic but a fatal signal in native code.
+#
+# None of that names the faulting instruction, so this does not argue: it lets
+# the kernel keep the corpse and reads it. A core file is the exact state at the
+# moment of death, which beats any stack sampled near it and beats reasoning
+# about gnubg's multithread.c from a Windows box.
+#
+# x86 runs alongside as a control -- same commands, same timings, and it passes
+# all eight assertions -- which is what makes the ARM result mean something.
+#
+# Delete once the cause is known and fixed.
+
+on:
+  workflow_dispatch:
+
+env:
+  ENGINE_ID: gnubg
+
+jobs:
+  stack:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+            label: linux-aarch64
+            runtime: linux-arm64
+          - os: ubuntu-latest
+            label: linux-x86_64
+            runtime: linux-x64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out gnubgapi
+        uses: actions/checkout@v4
+        with:
+          repository: customation/gnubgapi
+          path: gnubgapi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and stage exactly as the release does
+        run: |
+          cargo build --release
+          STAGE="stage/$ENGINE_ID"
+          mkdir -p "$STAGE/data"
+          cp target/release/gnubg-engine-server "$STAGE/"
+          cp gnubgapi/runtimes/${{ matrix.runtime }}/native/* "$STAGE/"
+          cp -r gnubgapi/data/. "$STAGE/data/"
+
+      - name: Machine facts
+        run: |
+          echo "nproc:        $(nproc)"
+          echo "arch:         $(uname -m)"
+          echo "libc:         $(ldd --version | head -1)"
+          # If gnubg's thread count is derived from the CPU count, an ARM runner
+          # with a different core count is the first thing worth ruling in.
+          echo "--- threading symbols in the engine library ---"
+          nm -D "stage/$ENGINE_ID/libgnubgapi.so" 2>/dev/null \
+            | grep -iE "pthread|MT_|multithread|Task" | head -20 || echo "  (none listed)"
+
+      - name: Install gdb
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+
+      # ptrace_scope is 1 on these images, so a non-root gdb cannot attach to a
+      # process it did not start. Lower it rather than running the daemon itself
+      # under sudo, which would change the thing being measured.
+      - name: Allow gdb to attach
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+
+      # Sampling the process at a fixed moment was the wrong instrument: the
+      # daemon was already gone at 45s, so it is DYING, not hanging. The ten
+      # minutes in the release run was just the harness waiting for a reply that
+      # was never coming. Nothing appeared on stderr either -- and run_e2e.py
+      # passes the daemon's stderr straight through -- so it is not a Rust panic
+      # but a fatal signal inside the native library.
+      #
+      # So let the kernel keep the corpse. A core file is the exact state at the
+      # moment of death, which is strictly better than any stack sampled near it.
+      - name: Keep the corpse
+        run: |
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
+          sudo sysctl -w fs.suid_dumpable=1
+
+      - name: Reproduce and read the corpse
+        run: |
+          set -u
+          ulimit -c unlimited
+          STAGE="stage/$ENGINE_ID"
+
+          # Run it straight, no backgrounding. Its exit status IS a finding:
+          # 139 is SIGSEGV, 132 SIGILL, 135 SIGBUS.
+          set +e
+          timeout 180 python3 tests/e2e/run_e2e.py \
+            "$STAGE/gnubg-engine-server" \
+            "$STAGE/libgnubgapi.so" \
+            "$STAGE/data" 2>&1 | tee e2e.log
+          HARNESS_STATUS=${PIPESTATUS[0]}
+          set -e
+          echo "harness exit: $HARNESS_STATUS"
+
+          echo "=== kernel's account ==="
+          sudo dmesg | grep -iE "segfault|trap|general protection|Code:" | tail -5 || echo "  (nothing)"
+
+          CORE="$(ls -t /tmp/core.* 2>/dev/null | head -1 || true)"
+          if [ -z "$CORE" ]; then
+            echo "### ${{ matrix.label }}: no core produced (harness exit $HARNESS_STATUS)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "=== backtrace from $CORE ==="
+          sudo gdb "$STAGE/gnubg-engine-server" "$CORE" -batch \
+            -ex "set pagination off" \
+            -ex "bt" \
+            -ex "info threads" \
+            -ex "thread apply all bt" 2>&1 | tee gdb.log
+
+          {
+            echo "### ${{ matrix.label }} (harness exit $HARNESS_STATUS)"
+            echo '```'
+            grep -E "^Program terminated|^#[0-9]+ |^Thread [0-9]" gdb.log | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
