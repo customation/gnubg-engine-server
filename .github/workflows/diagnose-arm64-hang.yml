@@ -109,7 +109,21 @@ jobs:
           # 45s is far past the former and far short of the harness timeout.
           sleep 45
 
-          PID="$(pgrep -f 'gnubg-engine-server' | head -1 || true)"
+          # Matched by EXECUTABLE, not by command line. The process tree here is
+          # timeout -> python3 -> gnubg-engine-server, and both ancestors carry
+          # the daemon's path in their arguments -- so `pgrep -f` returns the
+          # timeout wrapper, which is legitimately parked in sigsuspend waiting
+          # for its child. The first version of this file did exactly that and
+          # produced a stack that looked like an answer and was not.
+          # `pgrep -x` is no good either: Linux truncates comm to 15 characters,
+          # so the daemon is "gnubg-engine-se" there.
+          PID=""
+          for p in /proc/[0-9]*; do
+            exe="$(sudo readlink -f "$p/exe" 2>/dev/null || true)"
+            case "$exe" in
+              */stage/gnubg/gnubg-engine-server) PID="${p#/proc/}"; break ;;
+            esac
+          done
           if [ -z "$PID" ]; then
             echo "### ${{ matrix.label }}: daemon already gone at 45s" | tee -a "$GITHUB_STEP_SUMMARY"
             wait "$HARNESS" || true
