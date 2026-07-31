@@ -41,14 +41,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `lib` is the native library the daemon dlopens from beside its own
+          # executable (src/main.rs). It is named rather than globbed because
+          # the staging step copies the WHOLE runtimes/<rid>/native/ directory --
+          # on Windows that is libgnubgapi.dll plus its glib and gmp siblings --
+          # and the verification step below has to hand the daemon the one that
+          # is actually the engine.
           - os: windows-latest
             platform: windows-x86_64
             exe: gnubg-engine-server.exe
             runtime: win-x64
+            lib: libgnubgapi.dll
           - os: ubuntu-latest
             platform: linux-x86_64
             exe: gnubg-engine-server
             runtime: linux-x64
+            lib: libgnubgapi.so
           # `platform` and `runtime` disagree on purpose. `platform` is OUR
           # distribution vocabulary — the exact token the desktop client's
           # current_platform() returns and filters the catalogue by. `runtime` is
@@ -59,6 +67,7 @@ jobs:
             platform: linux-aarch64
             exe: gnubg-engine-server
             runtime: linux-arm64
+            lib: libgnubgapi.so
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -98,6 +107,9 @@ jobs:
       - name: Build the daemon
         run: cargo build --release
 
+      - name: Unit tests
+        run: cargo test --release
+
       # The layout the daemon resolves by default, relative to its own
       # executable — the native library beside it, gnubg's data under data/.
       # Every runtime library in the platform's runtimes folder comes along:
@@ -110,6 +122,37 @@ jobs:
           cp gnubgapi/runtimes/${{ matrix.runtime }}/native/* "$STAGE/"
           cp -r gnubgapi/data/. "$STAGE/data/"
           echo "Staged:"; find "$STAGE" -type f | wc -l; du -sh "$STAGE"
+
+      # The gate. Before this existed, every job here could go green while
+      # shipping an engine that evaluated positions wrongly -- and in the sibling
+      # repo one did: sage's linux-aarch64 build published on 2026-07-30 returned
+      # a different WinProb for the starting position than every x86 build, and
+      # nothing in its release workflow could have noticed, because the workflow
+      # compiled, checked a file existed, zipped it and uploaded it. gnubg links
+      # a different engine and could not have had that specific defect, but it
+      # had the same blind spot.
+      #
+      # Run against the STAGED tree, not the build tree: that is what users get,
+      # so this proves the layout, the native library beside the binary and
+      # gnubg's data files all work together rather than that a compiler
+      # succeeded.
+      #
+      # Python is preinstalled on every runner image and is a CI referee only --
+      # nothing a user installs requires it. The name probe is for Git Bash on
+      # windows-latest, which has `python` but not reliably `python3`.
+      - name: Prove the staged release evaluates correctly
+        run: |
+          PY=python3
+          command -v "$PY" > /dev/null 2>&1 || PY=python
+          command -v "$PY" > /dev/null 2>&1 || {
+            echo "::error::no Python on this runner; the release cannot be verified"
+            exit 1
+          }
+          STAGE="stage/$ENGINE_ID"
+          "$PY" tests/e2e/run_e2e.py \
+            "$STAGE/${{ matrix.exe }}" \
+            "$STAGE/${{ matrix.lib }}" \
+            "$STAGE/data"
 
       - name: Package and digest
         run: |
