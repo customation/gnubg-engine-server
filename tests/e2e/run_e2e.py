@@ -108,11 +108,16 @@ def main():
             level_ids == ["0ply", "1ply", "2ply", "3ply", "4ply", "rollout"],
             f"levels {level_ids}",
         )
-        by_id = {level["id"]: level for level in result["levels"]}
-        expect("evaluateCube" not in (by_id["3ply"].get("methods") or []), "3ply excludes cube")
-        expect(by_id["4ply"]["methods"] == ["evaluatePosition", "evaluateCube"], "4ply methods")
+        # No level declines anything: an absent `methods` means all four
+        # (spec §7). The ply-parity rule for the cube is real but is the
+        # host's to apply when CHOOSING a level, not the engine's to refuse
+        # when asked; and the rollout binds position, cube and moves alike.
+        for level in result["levels"]:
+            expect(
+                level.get("methods") is None,
+                f"{level['id']} should decline nothing, got {level.get('methods')}",
+            )
         rollout = result["levels"][-1]
-        expect(rollout["methods"] == ["evaluatePosition"], "rollout method exclusion")
         expect(rollout["configurable"] is True, "rollout configurable")
 
     check("describe", describe)
@@ -183,12 +188,51 @@ def main():
 
     check("rollout evaluatePosition", rollout_small)
 
-    def error_paths():
-        response = client.request("evaluateMoves", base_params("rollout", die1=3, die2=1))
-        expect(
-            response["error"]["code"] == -32602,
-            f"rollout method exclusion enforced: {response}",
+    def rollout_cube_small():
+        result = result_of(
+            client.request(
+                "evaluateCube",
+                base_params("rollout", levelOptions={"trials": 36}),
+                timeout=900,
+            )
         )
+        # The action comes from FindCubeDecision over the ROLLED-OUT
+        # outputs, so a rolled-out cube is a complete decision, not just
+        # two rows of probabilities.
+        expect("RecommendedAction" in result, f"cube rollout decision: {result}")
+        expect(0.4 < result["OurWinProb"] < 0.65, f"cube rollout win {result['OurWinProb']}")
+
+    check("rollout evaluateCube", rollout_cube_small)
+
+    def rollout_moves_small():
+        # Small on purpose, and the timing is the point: these options must
+        # actually reach gnubg. RolloutGeneral takes its context from the
+        # GLOBAL rcRollout for a fresh rollout, so a shim that sets only the
+        # per-move esMove.rc silently runs 1296 trials instead of 36 —
+        # indistinguishable from "rollouts are slow" unless something asks
+        # for a small one and expects it to finish.
+        result = result_of(
+            client.request(
+                "evaluateMoves",
+                base_params(
+                    "rollout",
+                    die1=3,
+                    die2=1,
+                    levelOptions={"trials": 36, "maxMoves": 2, "shortlistPlies": 0},
+                ),
+                timeout=900,
+            )
+        )
+        alternatives = result.get("Alternatives") or []
+        expect(len(alternatives) == 2, f"maxMoves honoured: {len(alternatives)} alternatives")
+        expect(
+            alternatives[0]["MoveNotation"] == "8/5 6/5",
+            f"3-1 rolls out to the five point, got {alternatives[0]['MoveNotation']}",
+        )
+
+    check("rollout evaluateMoves", rollout_moves_small)
+
+    def error_paths():
         response = client.request("evaluatePosition", base_params("7ply"))
         expect(response["error"]["code"] == -32001, f"unknown level: {response}")
         response = client.request(
