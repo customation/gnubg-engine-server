@@ -4,9 +4,12 @@
 //!
 //! gnubg's evaluator is one global neural net with static caches; the
 //! daemon owns exactly one initialized context and serializes every call
-//! on it. Levels are gnubg-convention plies (0-ply = raw NN) plus the
-//! position-only rollout — gnubgapi exposes no move/cube rollout, so the
-//! rollout level declares `methods: [evaluatePosition]` (spec §7).
+//! on it. Levels are gnubg-convention plies (0-ply = raw NN) plus a
+//! rollout that is currently position-only: our `gnubgapi` shim binds
+//! only `gnubgapi_rollout_position`, though gnubg itself rolls out
+//! checker plays and cube decisions too. The rollout level therefore
+//! declares `methods: [evaluatePosition]` (spec §7) — a gap in our
+//! wrapper to close, not a limit of the engine.
 
 use std::ffi::CString;
 use std::path::Path;
@@ -59,9 +62,18 @@ pub mod levels {
 // nearest 2 — gnubg 2-ply, sage 3-ply. `sage-engine-server` carries the
 // mirror of this note and likewise enforces nothing.
 //
-// The rollout level is different in kind and DOES still refuse: gnubgapi
-// exposes no move or cube rollout, so that is the engine reporting a
-// capability it does not have, not a judgement about what to want.
+// The rollout level still refuses everything but evaluatePosition, and
+// that is NOT a statement about gnubg. gnubg rolls out checker plays and
+// cube decisions perfectly well — CommandAnalyseRolloutMove and
+// CommandAnalyseRolloutCube, over the RolloutGeneral machinery. Our own
+// C shim simply has not bound them: `gnubgapi.h` exports exactly one
+// rollout entry point, gnubgapi_rollout_position.
+//
+// So this refusal is "not implemented in our wrapper yet", a gap to
+// close, not a limit to design around. Refusing is still the honest
+// answer while there is nothing to call — but do not let the declaration
+// harden into a belief that gnubg cannot do it. See
+// gnubgapi/native/gnubgapi.h.
 
 pub const WEIGHTS_FILENAME: &str = "gnubg.weights";
 pub const WEIGHTS_BINARY_FILENAME: &str = "gnubg.wd";
@@ -385,7 +397,10 @@ impl Engine {
                         checker_ply: Some(defaults.chequer_plies),
                         cube_ply: Some(defaults.cube_plies),
                     }),
-                    // gnubgapi has no move/cube rollout entry points.
+                    // Our gnubgapi shim binds only gnubgapi_rollout_position.
+                    // gnubg rolls out moves and cube decisions too; binding
+                    // those is outstanding work, and this list should shrink
+                    // to None when it lands.
                     methods: Some(vec![methods::EVALUATE_POSITION.to_string()]),
                     configurable: true,
                     // No progress callback or cancel in the gnubgapi ABI.
@@ -454,6 +469,9 @@ mod tests {
 
     #[test]
     fn rollout_answers_evaluate_position_only() {
+        // Reflects what our gnubgapi shim currently binds, not what gnubg
+        // can do. When gnubgapi_rollout_moves/_cube land, this expectation
+        // changes and the level's `methods` list drops to None.
         assert!(matches!(
             resolve_level(levels::ROLLOUT, methods::EVALUATE_POSITION, None),
             Ok(Resolved::Rollout(_))
