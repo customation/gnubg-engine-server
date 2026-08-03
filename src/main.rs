@@ -25,6 +25,9 @@ use engine::{resolve_level, Engine, LevelError};
 use ffi::GnubgApi;
 
 const ENV_GNUBGAPI_LIB: &str = "GNUBGAPI_LIB";
+/// Set to anything but 0/false/empty to log one line per request. Shared
+/// spelling with sage-engine-server on purpose — one switch, both engines.
+const ENV_LOG_REQUESTS: &str = "BEP_LOG_REQUESTS";
 
 const FLAG_GNUBGAPI_LIB: &str = "--gnubgapi-lib";
 const FLAG_DATA_DIR: &str = "--data-dir";
@@ -364,6 +367,26 @@ fn evaluate(method: &str, params: &EvaluateParams, engine: &Engine, id: &Value) 
         Err(error) => return level_error_response(id, error),
     };
 
+    // One line in, one line out, on stderr — stdout is the JSON-RPC channel.
+    // Same wording as the cloud workers' Recv/Done so the four engines'
+    // logs read alike, and the same env var as sage-engine-server so
+    // turning engine logging on does not mean remembering which engine.
+    let log_requests = request_logging_enabled();
+    let started = std::time::Instant::now();
+    if log_requests {
+        let dice = match (params.die1, params.die2) {
+            (Some(die1), Some(die2)) => format!(" Die={die1},{die2}"),
+            _ => String::new(),
+        };
+        eprintln!(
+            "Recv {method} Level={} {}{dice} Pos={} Match={}",
+            params.level,
+            engine.config_summary(&resolved),
+            params.position_id,
+            params.match_id
+        );
+    }
+
     let result: Result<Value, String> = match method {
         methods::EVALUATE_POSITION => engine
             .evaluate_position(&position_id, &match_id, &resolved)
@@ -425,9 +448,35 @@ fn evaluate(method: &str, params: &EvaluateParams, engine: &Engine, id: &Value) 
         }
     };
 
+    if log_requests {
+        let outcome = match &result {
+            Ok(_) => "ok".to_string(),
+            Err(message) => format!("FAILED {message}"),
+        };
+        eprintln!(
+            "Done {method} Level={} {outcome} in {} ms",
+            params.level,
+            started.elapsed().as_millis()
+        );
+    }
+
     match result {
         Ok(value) => jsonrpc::success(id, value),
         Err(message) => jsonrpc::error(Some(id), error_codes::EVALUATION_FAILED, &message),
+    }
+}
+
+/// Per-request logging is opt-in for the same reason as sage: the desktop
+/// host runs a pool of daemons, and a 36-roll pass across eight instances
+/// is 288 lines nobody asked for. Off by default, on when you are asking
+/// what the engine actually did.
+fn request_logging_enabled() -> bool {
+    match std::env::var(ENV_LOG_REQUESTS) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
     }
 }
 

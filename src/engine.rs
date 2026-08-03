@@ -295,6 +295,33 @@ impl Engine {
         }
     }
 
+    /// What a request actually resolved to, for logging.
+    ///
+    /// Built from the same merge the evaluation uses rather than from the
+    /// request, because requested-versus-effective is exactly the pair that
+    /// can silently diverge — a levelOptions field dropped between JSON and
+    /// gnubg is otherwise invisible, and its only symptom is a wait that
+    /// looks like the engine being slow.
+    pub fn config_summary(&self, resolved: &Resolved) -> String {
+        match resolved {
+            Resolved::Ply(depth) => format!("Plies={depth}"),
+            Resolved::Rollout(options) => {
+                let s = self.rollout_settings(options);
+                format!(
+                    "Trials={} Cubeful={} VR={} Chequer={}ply Cube={}ply Trunc={} Shortlist={}ply Max={}",
+                    s.n_trials,
+                    s.cubeful,
+                    s.variance_reduction,
+                    s.chequer_plies,
+                    s.cube_plies,
+                    if s.truncate != 0 { s.truncate_plies.to_string() } else { "off".to_string() },
+                    options.shortlist_plies.unwrap_or(DEFAULT_SHORTLIST_PLIES),
+                    options.max_moves.unwrap_or(DEFAULT_ROLLOUT_MOVES),
+                )
+            }
+        }
+    }
+
     /// Level options layered over the daemon's rollout defaults. Shared by
     /// the position, cube and move rollouts so a `levelOptions` field can
     /// never be honoured by one and quietly ignored by another.
