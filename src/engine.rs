@@ -39,23 +39,29 @@ pub mod levels {
     pub const ROLLOUT: &str = "rollout";
 }
 
-/// gnubg ply-parity rule for the cube: in gnubg's numbering, odd-ply
-/// trees leave the OPPONENT on roll at the leaves, biasing cube
-/// equities — only even plies (0, 2, 4) produce sensible cube
-/// decisions. 4-ply exists AS the deep-cube level; its full-movelist
-/// checker scoring would be pathological, so it answers position and
-/// cube only.
-fn ply_methods(depth: u32) -> Option<&'static [&'static str]> {
-    match depth {
-        1 | 3 => Some(&[
-            methods::EVALUATE_POSITION,
-            methods::EVALUATE_MOVES,
-            methods::ANALYZE_MOVE,
-        ]),
-        4 => Some(&[methods::EVALUATE_POSITION, methods::EVALUATE_CUBE]),
-        _ => None,
-    }
-}
+// Ply-parity note for the cube, gnubg counting.
+//
+// In gnubg's numbering, odd-ply trees leave the OPPONENT on roll at the
+// leaves, biasing cube equities — only even plies (0, 2, 4) produce
+// sensible cube decisions. 4-ply is the deep-cube level; its
+// full-movelist checker scoring is pathologically slow.
+//
+// Neither fact is enforced here. Every ply level answers every method,
+// because a caller may legitimately want a 3-ply cube to compare against
+// another implementation, or a 4-ply movelist knowing exactly what it
+// costs. Refusing prevents no real mistake: the mistake is never
+// "someone asked", it is "we picked the wrong depth on a user's behalf".
+//
+// That choice lives in the host, engine-neutrally and in ONE place, so
+// the rule cannot drift between engines: `analysis.ts` normalizes each
+// engine's advertised ply to a canonical base-0 depth, and
+// `gameEval.ts:pickCubeLevel` takes the even-canonical-depth level
+// nearest 2 — gnubg 2-ply, sage 3-ply. `sage-engine-server` carries the
+// mirror of this note and likewise enforces nothing.
+//
+// The rollout level is different in kind and DOES still refuse: gnubgapi
+// exposes no move or cube rollout, so that is the engine reporting a
+// capability it does not have, not a judgement about what to want.
 
 pub const WEIGHTS_FILENAME: &str = "gnubg.weights";
 pub const WEIGHTS_BINARY_FILENAME: &str = "gnubg.wd";
@@ -120,14 +126,6 @@ pub fn resolve_level(
             return Err(LevelError::InvalidOptions(format!(
                 "level {level_id:?} is not configurable"
             )));
-        }
-        if let Some(allowed) = ply_methods(depth) {
-            if !allowed.contains(&method) {
-                return Err(LevelError::MethodNotSupported {
-                    level: level_id.to_string(),
-                    method: method.to_string(),
-                });
-            }
         }
         Ok(Resolved::Ply(depth))
     };
@@ -344,10 +342,9 @@ impl Engine {
             display_name: None,
             ply_depth: Some(depth),
             rollout: None,
-            // The cube ply-parity rule (see ply_methods): odd plies never
-            // answer evaluateCube; 4-ply answers position/cube only.
-            methods: ply_methods(depth)
-                .map(|allowed| allowed.iter().map(|m| m.to_string()).collect()),
+            // Absent = answers all four methods (spec §7). Every ply level
+            // does; see the ply-parity note above for why that is deliberate.
+            methods: None,
             configurable: false,
             supports_progress: false,
             supports_cancel: false,
@@ -427,23 +424,32 @@ mod tests {
     }
 
     #[test]
-    fn cube_only_on_even_plies() {
-        // gnubg parity rule: odd plies never answer evaluateCube.
-        for level in [levels::PLY_1, levels::PLY_3] {
-            assert!(matches!(
-                resolve_level(level, methods::EVALUATE_CUBE, None),
-                Err(LevelError::MethodNotSupported { .. })
-            ));
-            assert!(resolve_level(level, methods::EVALUATE_MOVES, None).is_ok());
+    fn every_ply_level_answers_every_method() {
+        // The cube ply-parity rule is real (odd gnubg plies bias the cube)
+        // and so is 4-ply's cost, but neither is enforced here. A caller
+        // asking for a 3-ply cube to compare implementations, or a 4-ply
+        // movelist knowing what it costs, gets an answer. Choosing the
+        // right depth on a user's behalf is the host's job, in one place,
+        // so the rule cannot drift between engines.
+        for level in [
+            levels::PLY_0,
+            levels::PLY_1,
+            levels::PLY_2,
+            levels::PLY_3,
+            levels::PLY_4,
+        ] {
+            for method in [
+                methods::EVALUATE_POSITION,
+                methods::EVALUATE_CUBE,
+                methods::EVALUATE_MOVES,
+                methods::ANALYZE_MOVE,
+            ] {
+                assert!(
+                    resolve_level(level, method, None).is_ok(),
+                    "{level} refused {method}"
+                );
+            }
         }
-        for level in [levels::PLY_0, levels::PLY_2, levels::PLY_4] {
-            assert!(resolve_level(level, methods::EVALUATE_CUBE, None).is_ok());
-        }
-        // 4-ply is the deep-cube level: no full-movelist checker scoring.
-        assert!(matches!(
-            resolve_level(levels::PLY_4, methods::EVALUATE_MOVES, None),
-            Err(LevelError::MethodNotSupported { .. })
-        ));
     }
 
     #[test]
