@@ -4,25 +4,23 @@
 //!
 //! gnubg's evaluator is one global neural net with static caches; the
 //! daemon owns exactly one initialized context and serializes every call
-//! on it. Levels are gnubg-convention plies (0-ply = raw NN) plus a
-//! rollout that is currently position-only: our `gnubgapi` shim binds
-//! only `gnubgapi_rollout_position`, though gnubg itself rolls out
-//! checker plays and cube decisions too. The rollout level therefore
-//! declares `methods: [evaluatePosition]` (spec §7) — a gap in our
-//! wrapper to close, not a limit of the engine.
+//! on it. Levels are gnubg-convention plies (0-ply = raw NN) plus a fully
+//! configurable rollout that answers position, cube and move questions
+//! alike — `gnubgapi` binds `gnubgapi_rollout_position`, `_cube` and
+//! `_moves`, so no level declines anything.
 
 use std::ffi::CString;
 use std::path::Path;
 use std::sync::Arc;
 
 use bep_protocol::contract::{
-    kinds, methods, Conventions, Describe, EngineIdentity, Level, RolloutParams,
+    kinds, Conventions, Describe, EngineIdentity, Level, RolloutParams,
 };
 use serde::Deserialize;
 
 use crate::ffi::{
-    CubeDecisionResult, GnubgApi, GnubgApiError, RolloutSettings, ScoredMove, MAX_MOVES,
-    NUM_OUTPUTS,
+    CubeDecisionResult, GnubgApi, GnubgApiError, RolledMove, RolloutSettings, ScoredMove,
+    MAX_MOVES, NUM_OUTPUTS,
 };
 
 pub const PROTOCOL_VERSION: &str = "0.1";
@@ -62,21 +60,28 @@ pub mod levels {
 // nearest 2 — gnubg 2-ply, sage 3-ply. `sage-engine-server` carries the
 // mirror of this note and likewise enforces nothing.
 //
-// The rollout level still refuses everything but evaluatePosition, and
-// that is NOT a statement about gnubg. gnubg rolls out checker plays and
-// cube decisions perfectly well — CommandAnalyseRolloutMove and
-// CommandAnalyseRolloutCube, over the RolloutGeneral machinery. Our own
-// C shim simply has not bound them: `gnubgapi.h` exports exactly one
-// rollout entry point, gnubgapi_rollout_position.
+// The rollout level used to refuse everything but evaluatePosition, and
+// that was never a statement about gnubg — it rolls out checker plays and
+// cube decisions perfectly well, via CommandAnalyseRolloutMove and
+// CommandAnalyseRolloutCube over the RolloutGeneral machinery. The gap
+// was in our own C shim, which bound only gnubgapi_rollout_position.
 //
-// So this refusal is "not implemented in our wrapper yet", a gap to
-// close, not a limit to design around. Refusing is still the honest
-// answer while there is nothing to call — but do not let the declaration
-// harden into a belief that gnubg cannot do it. See
-// gnubgapi/native/gnubgapi.h.
+// It now binds gnubgapi_rollout_cube (GeneralCubeDecisionR, with the
+// action derived from the rolled-out outputs by gnubg's own
+// FindCubeDecision) and gnubgapi_rollout_moves (ScoreMoveRollout over a
+// shortlist). Nothing here declines anything any more.
 
 pub const WEIGHTS_FILENAME: &str = "gnubg.weights";
 pub const WEIGHTS_BINARY_FILENAME: &str = "gnubg.wd";
+
+/// Depth used to rank plays before picking which to roll out. 2-ply is
+/// gnubg's world-class evaluation and is what its own hint list uses, so
+/// the shortlist is already the right handful of candidates.
+const DEFAULT_SHORTLIST_PLIES: u32 = 2;
+/// How many shortlisted plays get rolled out by default. Deep enough to
+/// separate the genuine contenders, small enough that asking for a move
+/// rollout does not silently commit to fifteen of them.
+const DEFAULT_ROLLOUT_MOVES: u32 = 5;
 
 /// The level a request resolved to.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,19 +123,28 @@ pub struct RolloutOptions {
     pub truncate: Option<bool>,
     #[serde(default)]
     pub truncate_plies: Option<u32>,
+    /// evaluateMoves only: depth used to rank plays before choosing which
+    /// to roll out. Cheap and only decides the shortlist's quality.
+    #[serde(default)]
+    pub shortlist_plies: Option<u32>,
+    /// evaluateMoves only: how many of the shortlisted plays to actually
+    /// roll out. 0 means every legal play, which for an opening roll is
+    /// fifteen full rollouts — allowed, but ask for it deliberately.
+    #[serde(default)]
+    pub max_moves: Option<u32>,
 }
 
 #[derive(Debug)]
 pub enum LevelError {
     UnknownLevel(String),
     InvalidOptions(String),
-    /// Method not offered by the level (rollout answers evaluatePosition only).
-    MethodNotSupported { level: String, method: String },
 }
 
+/// Every level answers every method, so this resolves purely on the level
+/// id and its options. There is no method argument because there is nothing
+/// left to gate on — see the ply-parity note above.
 pub fn resolve_level(
     level_id: &str,
-    method: &str,
     options: Option<&serde_json::Value>,
 ) -> Result<Resolved, LevelError> {
     let ply = |depth: u32| -> Result<Resolved, LevelError> {
@@ -148,12 +162,6 @@ pub fn resolve_level(
         levels::PLY_3 => ply(3),
         levels::PLY_4 => ply(4),
         levels::ROLLOUT => {
-            if method != methods::EVALUATE_POSITION {
-                return Err(LevelError::MethodNotSupported {
-                    level: level_id.to_string(),
-                    method: method.to_string(),
-                });
-            }
             let parsed = match options {
                 None => RolloutOptions::default(),
                 Some(value) => serde_json::from_value(value.clone())
@@ -279,31 +287,7 @@ impl Engine {
                 })?
             }
             Resolved::Rollout(options) => {
-                let mut settings = self.rollout_defaults;
-                if let Some(trials) = options.trials {
-                    settings.n_trials = trials;
-                }
-                if let Some(cubeful) = options.cubeful {
-                    settings.cubeful = cubeful as i32;
-                }
-                if let Some(vr) = options.variance_reduction {
-                    settings.variance_reduction = vr as i32;
-                }
-                if let Some(chequer) = options.chequer_plies {
-                    settings.chequer_plies = chequer;
-                }
-                if let Some(cube) = options.cube_plies {
-                    settings.cube_plies = cube;
-                }
-                if let Some(seed) = options.seed {
-                    settings.seed = seed;
-                }
-                if let Some(truncate) = options.truncate {
-                    settings.truncate = truncate as i32;
-                }
-                if let Some(truncate_plies) = options.truncate_plies {
-                    settings.truncate_plies = truncate_plies;
-                }
+                let settings = self.rollout_settings(options);
                 self.run(move |inner| unsafe {
                     inner.api.rollout_position(inner.ctx, &position_id, &match_id, &settings)
                 })?
@@ -311,17 +295,68 @@ impl Engine {
         }
     }
 
+    /// Level options layered over the daemon's rollout defaults. Shared by
+    /// the position, cube and move rollouts so a `levelOptions` field can
+    /// never be honoured by one and quietly ignored by another.
+    fn rollout_settings(&self, options: &RolloutOptions) -> RolloutSettings {
+        let mut settings = self.rollout_defaults;
+        if let Some(trials) = options.trials {
+            settings.n_trials = trials;
+        }
+        if let Some(cubeful) = options.cubeful {
+            settings.cubeful = cubeful as i32;
+        }
+        if let Some(vr) = options.variance_reduction {
+            settings.variance_reduction = vr as i32;
+        }
+        if let Some(chequer) = options.chequer_plies {
+            settings.chequer_plies = chequer;
+        }
+        if let Some(cube) = options.cube_plies {
+            settings.cube_plies = cube;
+        }
+        if let Some(seed) = options.seed {
+            settings.seed = seed;
+        }
+        if let Some(truncate) = options.truncate {
+            settings.truncate = truncate as i32;
+        }
+        if let Some(truncate_plies) = options.truncate_plies {
+            settings.truncate_plies = truncate_plies;
+        }
+        settings
+    }
+
     pub fn evaluate_cube(
         &self,
         position_id: &CString,
         match_id: &CString,
-        n_plies: u32,
+        resolved: &Resolved,
     ) -> Result<CubeDecisionResult, GnubgApiError> {
         let position_id = position_id.clone();
         let match_id = match_id.clone();
-        self.run(move |inner| unsafe {
-            inner.api.evaluate_cube_decision(inner.ctx, &position_id, &match_id, n_plies)
-        })?
+        match resolved {
+            Resolved::Ply(depth) => {
+                let depth = *depth;
+                self.run(move |inner| unsafe {
+                    inner.api.evaluate_cube_decision(inner.ctx, &position_id, &match_id, depth)
+                })?
+            }
+            Resolved::Rollout(options) => {
+                let settings = self.rollout_settings(options);
+                // The shim derives the action from the rolled-out outputs
+                // with gnubg's FindCubeDecision, so this is the same shape
+                // the evaluated branch returns. Standard deviations are
+                // dropped here because the BEP CubeEvaluation contract has
+                // nowhere to carry them yet.
+                self.run(move |inner| unsafe {
+                    inner
+                        .api
+                        .rollout_cube(inner.ctx, &position_id, &match_id, &settings)
+                        .map(|(result, _std_dev)| result)
+                })?
+            }
+        }
     }
 
     pub fn scored_moves(
@@ -330,20 +365,60 @@ impl Engine {
         match_id: &CString,
         die1: i32,
         die2: i32,
-        n_plies: u32,
+        resolved: &Resolved,
     ) -> Result<Vec<ScoredMove>, GnubgApiError> {
         let position_id = position_id.clone();
         let match_id = match_id.clone();
-        self.run(move |inner| {
-            let mut buffer = vec![ScoredMove::zeroed(); MAX_MOVES];
-            let count = unsafe {
-                inner.api.generate_moves_with_eval(
-                    inner.ctx, &position_id, &match_id, die1, die2, n_plies, &mut buffer,
-                )
-            }?;
-            buffer.truncate(count);
-            Ok(buffer)
-        })?
+        match resolved {
+            Resolved::Ply(depth) => {
+                let depth = *depth;
+                self.run(move |inner| {
+                    let mut buffer = vec![ScoredMove::zeroed(); MAX_MOVES];
+                    let count = unsafe {
+                        inner.api.generate_moves_with_eval(
+                            inner.ctx, &position_id, &match_id, die1, die2, depth, &mut buffer,
+                        )
+                    }?;
+                    buffer.truncate(count);
+                    Ok(buffer)
+                })?
+            }
+            Resolved::Rollout(options) => {
+                let settings = self.rollout_settings(options);
+                let shortlist_plies = options.shortlist_plies.unwrap_or(DEFAULT_SHORTLIST_PLIES);
+                let max_moves = options.max_moves.unwrap_or(DEFAULT_ROLLOUT_MOVES);
+                self.run(move |inner| {
+                    let capacity =
+                        if max_moves == 0 { MAX_MOVES } else { max_moves as usize };
+                    let mut buffer = vec![RolledMove::zeroed(); capacity];
+                    let count = unsafe {
+                        inner.api.rollout_moves(
+                            inner.ctx, &position_id, &match_id, die1, die2,
+                            shortlist_plies, max_moves, &settings, &mut buffer,
+                        )
+                    }?;
+                    buffer.truncate(count);
+                    // Present rolled-out plays in the shape the rest of the
+                    // daemon already speaks. The rollout's own standard
+                    // deviations are dropped for the same reason as the cube
+                    // path: MoveHint has nowhere to put them.
+                    Ok(buffer
+                        .into_iter()
+                        .map(|rolled| ScoredMove {
+                            mv: rolled.mv,
+                            equity: rolled.score,
+                            probs: [
+                                rolled.output[0],
+                                rolled.output[1],
+                                rolled.output[2],
+                                rolled.output[3],
+                                rolled.output[4],
+                            ],
+                        })
+                        .collect())
+                })?
+            }
+        }
     }
 
     pub fn describe(&self, build: &str) -> Describe {
@@ -397,11 +472,10 @@ impl Engine {
                         checker_ply: Some(defaults.chequer_plies),
                         cube_ply: Some(defaults.cube_plies),
                     }),
-                    // Our gnubgapi shim binds only gnubgapi_rollout_position.
-                    // gnubg rolls out moves and cube decisions too; binding
-                    // those is outstanding work, and this list should shrink
-                    // to None when it lands.
-                    methods: Some(vec![methods::EVALUATE_POSITION.to_string()]),
+                    // Absent = all four (spec §7). The shim now binds
+                    // position, cube and move rollouts, so there is nothing
+                    // left for this level to decline.
+                    methods: None,
                     configurable: true,
                     // No progress callback or cancel in the gnubgapi ABI.
                     supports_progress: false,
@@ -431,72 +505,81 @@ mod tests {
 
     #[test]
     fn ply_levels_resolve_and_stamp_gnubg_convention() {
-        let resolved = resolve_level(levels::PLY_0, methods::EVALUATE_MOVES, None).unwrap();
+        let resolved = resolve_level(levels::PLY_0, None).unwrap();
         assert_eq!(resolved, Resolved::Ply(0));
         assert_eq!(resolved.plies_stamp(), 0);
-        let resolved = resolve_level(levels::PLY_2, methods::EVALUATE_CUBE, None).unwrap();
+        let resolved = resolve_level(levels::PLY_2, None).unwrap();
         assert_eq!(resolved.plies_stamp(), 2);
     }
 
     #[test]
-    fn every_ply_level_answers_every_method() {
+    fn every_level_resolves_without_regard_to_method() {
         // The cube ply-parity rule is real (odd gnubg plies bias the cube)
-        // and so is 4-ply's cost, but neither is enforced here. A caller
-        // asking for a 3-ply cube to compare implementations, or a 4-ply
-        // movelist knowing what it costs, gets an answer. Choosing the
-        // right depth on a user's behalf is the host's job, in one place,
-        // so the rule cannot drift between engines.
+        // and so is 4-ply's cost, but neither is enforced here, and neither
+        // is the rollout's shape. A caller asking for a 3-ply cube to
+        // compare implementations, or a 4-ply movelist knowing what it
+        // costs, gets an answer. Choosing the right depth on a user's
+        // behalf is the host's job, in one place, so the rule cannot drift
+        // between engines.
+        //
+        // `resolve_level` taking no method argument IS the contract: there
+        // is no longer anywhere for a method gate to live. If a method
+        // parameter ever reappears here, something has re-grown that this
+        // test exists to prevent.
         for level in [
             levels::PLY_0,
             levels::PLY_1,
             levels::PLY_2,
             levels::PLY_3,
             levels::PLY_4,
+            levels::ROLLOUT,
         ] {
-            for method in [
-                methods::EVALUATE_POSITION,
-                methods::EVALUATE_CUBE,
-                methods::EVALUATE_MOVES,
-                methods::ANALYZE_MOVE,
-            ] {
-                assert!(
-                    resolve_level(level, method, None).is_ok(),
-                    "{level} refused {method}"
-                );
-            }
+            assert!(resolve_level(level, None).is_ok(), "{level} did not resolve");
         }
+        assert!(matches!(
+            resolve_level("7ply", None),
+            Err(LevelError::UnknownLevel(_))
+        ));
     }
 
     #[test]
-    fn rollout_answers_evaluate_position_only() {
-        // Reflects what our gnubgapi shim currently binds, not what gnubg
-        // can do. When gnubgapi_rollout_moves/_cube land, this expectation
-        // changes and the level's `methods` list drops to None.
+    fn rollout_answers_every_method() {
+        // Was rollout_answers_evaluate_position_only. The shim now binds
+        // gnubgapi_rollout_cube and _moves alongside _position, so the
+        // level has nothing left to decline — which is the whole point of
+        // having closed that gap.
         assert!(matches!(
-            resolve_level(levels::ROLLOUT, methods::EVALUATE_POSITION, None),
+            resolve_level(levels::ROLLOUT, None),
             Ok(Resolved::Rollout(_))
         ));
-        assert!(matches!(
-            resolve_level(levels::ROLLOUT, methods::EVALUATE_MOVES, None),
-            Err(LevelError::MethodNotSupported { .. })
-        ));
+        // And it still parses its options rather than ignoring them.
+        let options = serde_json::json!({"trials": 36, "maxMoves": 3, "shortlistPlies": 0});
+        assert_eq!(
+            resolve_level(levels::ROLLOUT, Some(&options)).unwrap(),
+            Resolved::Rollout(RolloutOptions {
+                trials: Some(36),
+                max_moves: Some(3),
+                shortlist_plies: Some(0),
+                ..RolloutOptions::default()
+            })
+        );
     }
 
     #[test]
     fn rollout_options_reject_unknown_keys_and_ply_levels_reject_options() {
         let options = serde_json::json!({"trials": 108, "bogus": true});
         assert!(matches!(
-            resolve_level(levels::ROLLOUT, methods::EVALUATE_POSITION, Some(&options)),
+            resolve_level(levels::ROLLOUT, Some(&options)),
             Err(LevelError::InvalidOptions(_))
         ));
         let options = serde_json::json!({"trials": 108});
         assert!(matches!(
-            resolve_level(levels::PLY_2, methods::EVALUATE_POSITION, Some(&options)),
+            resolve_level(levels::PLY_2, Some(&options)),
             Err(LevelError::InvalidOptions(_))
         ));
         let options = serde_json::json!({"trials": 108, "cubePlies": 2});
         let resolved =
-            resolve_level(levels::ROLLOUT, methods::EVALUATE_POSITION, Some(&options)).unwrap();
+            resolve_level(levels::ROLLOUT, Some(&options)).unwrap();
         assert_eq!(
             resolved,
             Resolved::Rollout(RolloutOptions {

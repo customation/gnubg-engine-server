@@ -21,7 +21,7 @@ use bep_protocol::contract::{error_codes, methods, CancelParams, EvaluateParams}
 use bep_protocol::jsonrpc::{self, codes, FrameSink, Incoming};
 use serde_json::Value;
 
-use engine::{resolve_level, Engine, LevelError, Resolved};
+use engine::{resolve_level, Engine, LevelError};
 use ffi::GnubgApi;
 
 const ENV_GNUBGAPI_LIB: &str = "GNUBGAPI_LIB";
@@ -337,11 +337,6 @@ fn level_error_response(id: &Value, error: LevelError) -> Value {
         LevelError::InvalidOptions(message) => {
             jsonrpc::error(Some(id), codes::INVALID_PARAMS, &message)
         }
-        LevelError::MethodNotSupported { level, method } => jsonrpc::error(
-            Some(id),
-            codes::INVALID_PARAMS,
-            &format!("level {level:?} does not answer {method} (see describe.levels[].methods)"),
-        ),
     }
 }
 
@@ -364,7 +359,7 @@ fn evaluate(method: &str, params: &EvaluateParams, engine: &Engine, id: &Value) 
         }
     };
 
-    let resolved = match resolve_level(&params.level, method, params.level_options.as_ref()) {
+    let resolved = match resolve_level(&params.level, params.level_options.as_ref()) {
         Ok(resolved) => resolved,
         Err(error) => return level_error_response(id, error),
     };
@@ -375,20 +370,12 @@ fn evaluate(method: &str, params: &EvaluateParams, engine: &Engine, id: &Value) 
             .map_err(|e| e.to_string())
             .map(|output| mapping::position_payload(&output, &params.position_id))
             .and_then(to_result_value),
-        methods::EVALUATE_CUBE => {
-            let Resolved::Ply(depth) = resolved else {
-                unreachable!("resolve_level restricts rollout to evaluatePosition")
-            };
-            engine
-                .evaluate_cube(&position_id, &match_id, depth)
-                .map_err(|e| e.to_string())
-                .and_then(|r| mapping::cube_payload(&r, &params.position_id))
-                .and_then(to_result_value)
-        }
+        methods::EVALUATE_CUBE => engine
+            .evaluate_cube(&position_id, &match_id, &resolved)
+            .map_err(|e| e.to_string())
+            .and_then(|r| mapping::cube_payload(&r, &params.position_id))
+            .and_then(to_result_value),
         methods::EVALUATE_MOVES | methods::ANALYZE_MOVE => {
-            let Resolved::Ply(depth) = &resolved else {
-                unreachable!("resolve_level restricts rollout to evaluatePosition")
-            };
             let (die1, die2) = match (params.die1, params.die2) {
                 (Some(die1), Some(die2)) if (1..=6).contains(&die1) && (1..=6).contains(&die2) => {
                     (die1, die2)
@@ -402,7 +389,7 @@ fn evaluate(method: &str, params: &EvaluateParams, engine: &Engine, id: &Value) 
                 }
             };
             let moves = engine
-                .scored_moves(&position_id, &match_id, die1, die2, *depth)
+                .scored_moves(&position_id, &match_id, die1, die2, &resolved)
                 .map_err(|e| e.to_string())
                 .and_then(|scored| {
                     mapping::move_hints(

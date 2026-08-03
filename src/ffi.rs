@@ -95,6 +95,24 @@ pub struct ScoredMove {
     pub probs: [f64; 5],
 }
 
+/// Mirrors `gnubgapi_rolled_move`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RolledMove {
+    pub mv: NativeMove,
+    pub output: [f64; NUM_OUTPUTS],
+    pub std_dev: [f64; NUM_OUTPUTS],
+    /// The score the shim ranked on — cubeful when the rollout is
+    /// cubeful, equity or MWC depending on match play.
+    pub score: f64,
+}
+
+impl RolledMove {
+    pub fn zeroed() -> RolledMove {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 impl ScoredMove {
     pub fn zeroed() -> ScoredMove {
         unsafe { std::mem::zeroed() }
@@ -139,6 +157,29 @@ type FnRollout = unsafe extern "C" fn(
     *const RolloutSettings,
     *mut f64,
     *mut f64,
+) -> c_int;
+/// `gnubgapi_rollout_cube` — fills the same `CubeDecisionResult` the
+/// evaluated path produces, plus per-output standard deviations as
+/// `double[2][7]`.
+type FnRolloutCube = unsafe extern "C" fn(
+    *mut ContextOpaque,
+    *const c_char,
+    *const c_char,
+    *const RolloutSettings,
+    *mut CubeDecisionResult,
+    *mut [f64; NUM_OUTPUTS],
+) -> c_int;
+type FnRolloutMoves = unsafe extern "C" fn(
+    *mut ContextOpaque,
+    *const c_char,
+    *const c_char,
+    c_int,
+    c_int,
+    u32,
+    u32,
+    *const RolloutSettings,
+    *mut RolledMove,
+    *mut u32,
 ) -> c_int;
 type FnGenerateMovesWithEval = unsafe extern "C" fn(
     *mut ContextOpaque,
@@ -307,6 +348,84 @@ impl GnubgApi {
         );
         if code == GNUBGAPI_OK {
             Ok(output)
+        } else {
+            Err(self.last_error(code))
+        }
+    }
+
+    /// Roll out a cube decision.
+    ///
+    /// Returns the same `CubeDecisionResult` shape the evaluated path
+    /// produces — so a rolled-out cube action is a drop-in replacement —
+    /// alongside per-output standard deviations (row 0 no double, row 1
+    /// double/take).
+    ///
+    /// SAFETY: caller serializes calls on `ctx`.
+    pub unsafe fn rollout_cube(
+        &self,
+        ctx: *mut ContextOpaque,
+        position_id: &CString,
+        match_id: &CString,
+        settings: &RolloutSettings,
+    ) -> Result<(CubeDecisionResult, [[f64; NUM_OUTPUTS]; 2]), GnubgApiError> {
+        let f: Symbol<FnRolloutCube> = self.sym(b"gnubgapi_rollout_cube");
+        let mut result = CubeDecisionResult::default();
+        let mut std_dev = [[0f64; NUM_OUTPUTS]; 2];
+        let code = f(
+            ctx,
+            position_id.as_ptr(),
+            match_id.as_ptr(),
+            settings,
+            &mut result,
+            std_dev.as_mut_ptr(),
+        );
+        if code == GNUBGAPI_OK {
+            Ok((result, std_dev))
+        } else {
+            Err(self.last_error(code))
+        }
+    }
+
+    /// Roll out candidate plays, best-first by the rolled-out score.
+    ///
+    /// `max_moves` bounds both the work and the buffer the shim writes:
+    /// 0 means every legal play, which is why the buffer must then be
+    /// MAX_MOVES long.
+    ///
+    /// SAFETY: caller serializes calls on `ctx`.
+    pub unsafe fn rollout_moves(
+        &self,
+        ctx: *mut ContextOpaque,
+        position_id: &CString,
+        match_id: &CString,
+        die1: i32,
+        die2: i32,
+        n_plies: u32,
+        max_moves: u32,
+        settings: &RolloutSettings,
+        buffer: &mut [RolledMove],
+    ) -> Result<usize, GnubgApiError> {
+        let required = if max_moves == 0 { MAX_MOVES } else { max_moves as usize };
+        assert!(
+            buffer.len() >= required,
+            "rollout_moves needs room for {required} entries"
+        );
+        let f: Symbol<FnRolloutMoves> = self.sym(b"gnubgapi_rollout_moves");
+        let mut count: u32 = 0;
+        let code = f(
+            ctx,
+            position_id.as_ptr(),
+            match_id.as_ptr(),
+            die1,
+            die2,
+            n_plies,
+            max_moves,
+            settings,
+            buffer.as_mut_ptr(),
+            &mut count,
+        );
+        if code == GNUBGAPI_OK {
+            Ok(count as usize)
         } else {
             Err(self.last_error(code))
         }
